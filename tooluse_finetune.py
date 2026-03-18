@@ -146,6 +146,7 @@ def main():
     attn_tgts  = get_attention_targets(model)
 
     lora_cfg = build_lora_config(
+        model=model,
         mamba_targets=mamba_tgts,
         attn_targets=attn_tgts,
         rank_m=preset["rank_m"],

@@ -123,6 +123,7 @@ def get_attention_targets(model: nn.Module) -> list[str]:
 
 
 def build_lora_config(
+    model: nn.Module,
     mamba_targets: list[str],
     attn_targets: list[str],
     rank_m: int,
@@ -132,49 +133,55 @@ def build_lora_config(
     dropout: float = 0.05,
 ) -> LoraConfig:
     """
-    Build a single LoraConfig that assigns different ranks to the Mamba
-    and attention paths via rank_pattern and alpha_pattern.
+    Build a single LoraConfig with correct per-path rank assignment.
 
-    A single LoraConfig is the correct approach for training: PEFT wraps
-    the model once and all adapter parameters are in the same training
-    graph, so AdamW updates both path's adapters in a single backward pass.
+    IMPORTANT — rank_pattern key semantics:
+      PEFT resolves rank via:
+          r = config.rank_pattern.get(key, config.r)
+      where `key` is the FULL dotted module name from named_modules()
+      (e.g. "layers.0.self_attn.q_proj"), NOT just the leaf name.
+      Using only leaf names ("q_proj") as keys causes silent fallback
+      to base_r for every layer — the asymmetry is never applied.
 
-    The rank_pattern / alpha_pattern dicts map leaf module names to their
-    per-path rank/alpha. PEFT looks up each target layer's leaf name in
-    rank_pattern at injection time; if found, it uses that rank; otherwise
-    it falls back to the base `r`. We prevent the silent fallback by:
-      (1) explicitly populating rank_pattern for every target leaf name, and
-      (2) setting base r = rank_m (the Mamba rank) so that any accidental
-          miss on the Mamba side is still correct, and
-      (3) running verify_lora_ranks() after injection to assert every
-          adapter has the intended rank before training starts.
+    This function walks model.named_modules() to build rank_pattern and
+    alpha_pattern with full dotted paths as keys, guaranteeing the correct
+    rank on every layer with no silent fallback.
 
-    Works for both symmetric (rank_m == rank_a) and asymmetric cases.
+    The `model` argument is required so we can enumerate the actual
+    module paths.
     """
     all_targets = list(dict.fromkeys(mamba_targets + attn_targets))
+    rank_pattern: dict[str, int]  = {}
+    alpha_pattern: dict[str, int] = {}
 
-    # Build explicit per-leaf dicts — every leaf name must be present
-    rank_pattern  = {t: rank_m for t in mamba_targets}
-    alpha_pattern = {t: alpha_m for t in mamba_targets}
-    rank_pattern.update( {t: rank_a  for t in attn_targets})
-    alpha_pattern.update({t: alpha_a for t in attn_targets})
+    mamba_set = set(mamba_targets)
+    attn_set  = set(attn_targets)
 
+    for full_name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        leaf = full_name.split(".")[-1]
+        if leaf in mamba_set:
+            rank_pattern[full_name]  = rank_m
+            alpha_pattern[full_name] = alpha_m
+        elif leaf in attn_set:
+            rank_pattern[full_name]  = rank_a
+            alpha_pattern[full_name] = alpha_a
+
+    n_mamba = sum(1 for v in rank_pattern.values() if v == rank_m)
+    n_attn  = sum(1 for v in rank_pattern.values() if v == rank_a)
     logger.info(
-        "LoRA config — Mamba: targets=%s r=%d alpha=%d | "
-        "Attn: targets=%s r=%d alpha=%d",
-        mamba_targets, rank_m, alpha_m,
-        attn_targets,  rank_a, alpha_a,
+        "rank_pattern built with full paths: "
+        "%d Mamba layers (r=%d, alpha=%d), "
+        "%d Attn layers (r=%d, alpha=%d)",
+        n_mamba, rank_m, alpha_m,
+        n_attn,  rank_a, alpha_a,
     )
-    logger.info("rank_pattern:  %s", rank_pattern)
-    logger.info("alpha_pattern: %s", alpha_pattern)
 
     return LoraConfig(
         task_type=TaskType.CAUSAL_LM,
-        # Base r = rank_m. rank_pattern overrides this per-leaf.
-        # Attention leaves are always present in rank_pattern so they
-        # always get rank_a, never the base rank_m.
-        r=rank_m,
-        lora_alpha=alpha_m,
+        r=rank_m,               # base fallback — should never be used
+        lora_alpha=alpha_m,     # base fallback — should never be used
         lora_dropout=dropout,
         target_modules=all_targets,
         rank_pattern=rank_pattern,
