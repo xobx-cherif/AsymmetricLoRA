@@ -34,7 +34,7 @@ from shared_utils import (
     count_trainable_params,
     get_attention_targets,
     get_mamba_targets,
-    inject_lora_two_pass,
+    inject_lora,
     load_base_model,
     load_wikitext,
     logger,
@@ -106,7 +106,7 @@ def main():
     mamba_tgts = get_mamba_targets(model)
     attn_tgts  = get_attention_targets(model)
 
-    mamba_cfg, attn_cfg = build_lora_config(
+    lora_cfg = build_lora_config(
         mamba_targets=mamba_tgts,
         attn_targets=attn_tgts,
         rank_m=args.rank,
@@ -115,7 +115,7 @@ def main():
         alpha_a=alpha,
         dropout=args.dropout,
     )
-    model = inject_lora_two_pass(model, mamba_cfg, attn_cfg)
+    model = inject_lora(model, lora_cfg)
     param_counts = count_trainable_params(model)
     logger.info("Trainable params: %.3fM (%.2f%%)",
                 param_counts["total_M"], param_counts["pct"])

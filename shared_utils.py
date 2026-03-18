@@ -130,47 +130,57 @@ def build_lora_config(
     alpha_m: int,
     alpha_a: int,
     dropout: float = 0.05,
-) -> tuple:
+) -> LoraConfig:
     """
-    Return two separate LoraConfig objects — one per path — each with their
-    own explicit rank and alpha.
+    Build a single LoraConfig that assigns different ranks to the Mamba
+    and attention paths via rank_pattern and alpha_pattern.
 
-    Why two configs instead of rank_pattern / alpha_pattern:
-      PEFT's rank_pattern only overrides layers whose leaf name is an exact
-      key in the dict.  Any unmatched leaf silently falls back to the base
-      rank `r`.  This is the same class of silent failure that caused
-      MOAFT's outproj_trainable_M=0.0 bug.  Two explicit configs guarantee
-      the correct rank on every targeted layer with no silent fallback.
+    A single LoraConfig is the correct approach for training: PEFT wraps
+    the model once and all adapter parameters are in the same training
+    graph, so AdamW updates both path's adapters in a single backward pass.
 
-    For the symmetric case (rank_m == rank_a) both configs have equal rank;
-    the two-pass injection is still safe and explicit.
+    The rank_pattern / alpha_pattern dicts map leaf module names to their
+    per-path rank/alpha. PEFT looks up each target layer's leaf name in
+    rank_pattern at injection time; if found, it uses that rank; otherwise
+    it falls back to the base `r`. We prevent the silent fallback by:
+      (1) explicitly populating rank_pattern for every target leaf name, and
+      (2) setting base r = rank_m (the Mamba rank) so that any accidental
+          miss on the Mamba side is still correct, and
+      (3) running verify_lora_ranks() after injection to assert every
+          adapter has the intended rank before training starts.
 
-    Returns:
-        (mamba_cfg, attn_cfg) — pass to inject_lora_two_pass().
+    Works for both symmetric (rank_m == rank_a) and asymmetric cases.
     """
-    mamba_cfg = LoraConfig(
+    all_targets = list(dict.fromkeys(mamba_targets + attn_targets))
+
+    # Build explicit per-leaf dicts — every leaf name must be present
+    rank_pattern  = {t: rank_m for t in mamba_targets}
+    alpha_pattern = {t: alpha_m for t in mamba_targets}
+    rank_pattern.update( {t: rank_a  for t in attn_targets})
+    alpha_pattern.update({t: alpha_a for t in attn_targets})
+
+    logger.info(
+        "LoRA config — Mamba: targets=%s r=%d alpha=%d | "
+        "Attn: targets=%s r=%d alpha=%d",
+        mamba_targets, rank_m, alpha_m,
+        attn_targets,  rank_a, alpha_a,
+    )
+    logger.info("rank_pattern:  %s", rank_pattern)
+    logger.info("alpha_pattern: %s", alpha_pattern)
+
+    return LoraConfig(
         task_type=TaskType.CAUSAL_LM,
+        # Base r = rank_m. rank_pattern overrides this per-leaf.
+        # Attention leaves are always present in rank_pattern so they
+        # always get rank_a, never the base rank_m.
         r=rank_m,
         lora_alpha=alpha_m,
         lora_dropout=dropout,
-        target_modules=mamba_targets,
+        target_modules=all_targets,
+        rank_pattern=rank_pattern,
+        alpha_pattern=alpha_pattern,
         bias="none",
     )
-    attn_cfg = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=rank_a,
-        lora_alpha=alpha_a,
-        lora_dropout=dropout,
-        target_modules=attn_targets,
-        bias="none",
-    )
-    logger.info(
-        "LoRA configs — Mamba: targets=%s r=%d alpha=%d | "
-        "Attn: targets=%s r=%d alpha=%d",
-        mamba_targets, rank_m, alpha_m,
-        attn_targets, rank_a, alpha_a,
-    )
-    return mamba_cfg, attn_cfg
 
 
 def load_base_model(model_name: str) -> tuple:
@@ -201,58 +211,68 @@ def load_base_model(model_name: str) -> tuple:
     return model, tokenizer
 
 
-def inject_lora_two_pass(
-    model: nn.Module,
-    mamba_cfg: LoraConfig,
-    attn_cfg: LoraConfig,
-) -> nn.Module:
+def inject_lora(model: nn.Module, cfg: LoraConfig) -> nn.Module:
     """
-    Inject LoRA adapters in two explicit passes — one per path.
+    Wrap model with PEFT LoRA adapters using a single LoraConfig.
 
-    Pass 1: inject Mamba-path adapters (mamba.in_proj) at rank r_m.
-    Pass 2: inject Attention-path adapters (q/k/v/o_proj) at rank r_a.
+    A single get_peft_model call is correct for training: all adapter
+    parameters — both Mamba-path and attention-path — are injected into
+    one unified model wrapper. AdamW receives a single parameter list and
+    updates all adapters in the same backward pass.
 
-    After each pass, the actual trainable parameter counts are verified
-    and logged.  An assertion guards against silent injection failure
-    (the bug that caused MOAFT's outproj_trainable_M=0.0).
-
-    Works for both symmetric (r_m == r_a) and asymmetric cases.
+    After injection, verify_lora_ranks() asserts that every target layer
+    received the intended rank (guards against silent rank_pattern fallback).
     """
-    # Pass 1 — Mamba path
-    model = get_peft_model(model, mamba_cfg)
-    _verify_injection(model, mamba_cfg.target_modules, label="Mamba")
-
-    # Pass 2 — Attention path
-    # add_adapter injects a second adapter on top of the first without
-    # removing the Mamba adapters already injected.
-    model.add_adapter("attn_adapter", attn_cfg)
-    model.set_adapter(["default", "attn_adapter"])
-    _verify_injection(model, attn_cfg.target_modules, label="Attn")
-
+    model = get_peft_model(model, cfg)
+    verify_lora_ranks(model, cfg)
     model.print_trainable_parameters()
     return model
 
 
-def _verify_injection(
-    model: nn.Module, targets: list[str], label: str
-) -> None:
+def verify_lora_ranks(model: nn.Module, cfg: LoraConfig) -> None:
     """
-    Assert that at least one trainable LoRA parameter exists for each
-    target leaf name.  Raises AssertionError on silent injection failure.
+    Assert that every LoRA adapter in the model has the rank specified
+    by cfg.rank_pattern (or cfg.r if the leaf is not in rank_pattern).
+
+    Guards against the silent fallback behaviour of rank_pattern: if a
+    leaf name is not found in rank_pattern, PEFT uses the base cfg.r.
+    This check makes that fallback visible as an AssertionError rather
+    than a silent correctness bug.
+
+    Also asserts that at least one lora_ parameter exists for each entry
+    in cfg.target_modules, catching complete injection failures.
     """
-    trainable_names = {
-        n for n, p in model.named_parameters() if p.requires_grad
-    }
-    for leaf in targets:
-        matched = [n for n in trainable_names if leaf in n and "lora_" in n]
+    trainable = {n: p for n, p in model.named_parameters() if p.requires_grad}
+
+    # 1. Every target leaf must have at least one lora_ parameter
+    for leaf in cfg.target_modules:
+        matched = [n for n in trainable if leaf in n and "lora_" in n]
         assert matched, (
-            f"LoRA injection failed for {label} target '{leaf}': "
+            f"LoRA injection failed for target '{leaf}': "
             f"no trainable lora_ parameter found. "
             f"Check target_modules and PEFT blacklist."
         )
+
+    # 2. Verify each lora_A matrix has the expected rank (shape[0] == r)
+    rank_pattern = getattr(cfg, "rank_pattern", {}) or {}
+    for name, param in trainable.items():
+        if "lora_A" not in name:
+            continue
+        leaf = name.split(".")[-3] if "lora_A" in name else None
+        if leaf is None:
+            continue
+        expected_r = rank_pattern.get(leaf, cfg.r)
+        actual_r   = param.shape[0]
+        assert actual_r == expected_r, (
+            f"Rank mismatch for {name}: "
+            f"expected r={expected_r} (from rank_pattern[{leaf!r}]), "
+            f"got r={actual_r}. "
+            f"Ensure '{leaf}' is in rank_pattern with the correct value."
+        )
+
     logger.info(
-        "%s LoRA injection verified: all %d targets have trainable adapters.",
-        label, len(targets),
+        "verify_lora_ranks: all %d lora_A matrices have correct ranks.",
+        sum(1 for n in trainable if "lora_A" in n),
     )
 
 
