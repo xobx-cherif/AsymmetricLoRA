@@ -130,28 +130,47 @@ def build_lora_config(
     alpha_m: int,
     alpha_a: int,
     dropout: float = 0.05,
-) -> LoraConfig:
+) -> tuple:
     """
-    Build a LoraConfig with per-module rank and alpha patterns.
-    Works for both symmetric (rank_m == rank_a) and asymmetric cases.
-    """
-    all_targets = list(dict.fromkeys(mamba_targets + attn_targets))
-    rank_pattern  = {t: rank_m for t in mamba_targets}
-    rank_pattern.update({t: rank_a for t in attn_targets})
-    alpha_pattern = {t: alpha_m for t in mamba_targets}
-    alpha_pattern.update({t: alpha_a for t in attn_targets})
+    Return two separate LoraConfig objects — one per path — each with their
+    own explicit rank and alpha.
 
-    base_rank = max(rank_m, rank_a)
-    return LoraConfig(
+    Why two configs instead of rank_pattern / alpha_pattern:
+      PEFT's rank_pattern only overrides layers whose leaf name is an exact
+      key in the dict.  Any unmatched leaf silently falls back to the base
+      rank `r`.  This is the same class of silent failure that caused
+      MOAFT's outproj_trainable_M=0.0 bug.  Two explicit configs guarantee
+      the correct rank on every targeted layer with no silent fallback.
+
+    For the symmetric case (rank_m == rank_a) both configs have equal rank;
+    the two-pass injection is still safe and explicit.
+
+    Returns:
+        (mamba_cfg, attn_cfg) — pass to inject_lora_two_pass().
+    """
+    mamba_cfg = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
-        r=base_rank,
+        r=rank_m,
         lora_alpha=alpha_m,
         lora_dropout=dropout,
-        target_modules=all_targets,
-        rank_pattern=rank_pattern,
-        alpha_pattern=alpha_pattern,
+        target_modules=mamba_targets,
         bias="none",
     )
+    attn_cfg = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=rank_a,
+        lora_alpha=alpha_a,
+        lora_dropout=dropout,
+        target_modules=attn_targets,
+        bias="none",
+    )
+    logger.info(
+        "LoRA configs — Mamba: targets=%s r=%d alpha=%d | "
+        "Attn: targets=%s r=%d alpha=%d",
+        mamba_targets, rank_m, alpha_m,
+        attn_targets, rank_a, alpha_a,
+    )
+    return mamba_cfg, attn_cfg
 
 
 def load_base_model(model_name: str) -> tuple:
@@ -182,11 +201,59 @@ def load_base_model(model_name: str) -> tuple:
     return model, tokenizer
 
 
-def inject_lora(model, cfg: LoraConfig) -> nn.Module:
-    """Wrap model with PEFT LoRA adapters and log trainable parameters."""
-    model = get_peft_model(model, cfg)
+def inject_lora_two_pass(
+    model: nn.Module,
+    mamba_cfg: LoraConfig,
+    attn_cfg: LoraConfig,
+) -> nn.Module:
+    """
+    Inject LoRA adapters in two explicit passes — one per path.
+
+    Pass 1: inject Mamba-path adapters (mamba.in_proj) at rank r_m.
+    Pass 2: inject Attention-path adapters (q/k/v/o_proj) at rank r_a.
+
+    After each pass, the actual trainable parameter counts are verified
+    and logged.  An assertion guards against silent injection failure
+    (the bug that caused MOAFT's outproj_trainable_M=0.0).
+
+    Works for both symmetric (r_m == r_a) and asymmetric cases.
+    """
+    # Pass 1 — Mamba path
+    model = get_peft_model(model, mamba_cfg)
+    _verify_injection(model, mamba_cfg.target_modules, label="Mamba")
+
+    # Pass 2 — Attention path
+    # add_adapter injects a second adapter on top of the first without
+    # removing the Mamba adapters already injected.
+    model.add_adapter("attn_adapter", attn_cfg)
+    model.set_adapter(["default", "attn_adapter"])
+    _verify_injection(model, attn_cfg.target_modules, label="Attn")
+
     model.print_trainable_parameters()
     return model
+
+
+def _verify_injection(
+    model: nn.Module, targets: list[str], label: str
+) -> None:
+    """
+    Assert that at least one trainable LoRA parameter exists for each
+    target leaf name.  Raises AssertionError on silent injection failure.
+    """
+    trainable_names = {
+        n for n, p in model.named_parameters() if p.requires_grad
+    }
+    for leaf in targets:
+        matched = [n for n in trainable_names if leaf in n and "lora_" in n]
+        assert matched, (
+            f"LoRA injection failed for {label} target '{leaf}': "
+            f"no trainable lora_ parameter found. "
+            f"Check target_modules and PEFT blacklist."
+        )
+    logger.info(
+        "%s LoRA injection verified: all %d targets have trainable adapters.",
+        label, len(targets),
+    )
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
